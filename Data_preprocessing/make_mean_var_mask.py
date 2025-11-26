@@ -1,231 +1,205 @@
-#!/usr/bin/env python
-"""
-make_mean_var_mask.py
-
-원본 RGB 이미지(head/train, head/test)를 대상으로
-
-- 픽셀 단위 채널 평균(μ), 분산(σ^2)을 계산하고
-- 분산 + Otsu(밝기) 기반 thresholding으로 segmentation mask를 만들고
-- mask PNG(0/255)를 mask_root 아래에 저장한다.
-- 같은 mask를 이용해 배경을 초록색(0,255,0)으로 채운 RGB를 green_root 아래에 저장한다.
-
-사용 예시:
-
-    cd COW_V2/code/Data_preprocessing
-
-    python make_mean_var_mask.py \
-        --src_root ../../head \
-        --mask_root ../../head/mask_mean_var_0015 \
-        --green_root ../../head/segmentation_var_0015 \
-        --var_thresh 0.0015
-"""
+# make_mean_var_mask.py
+# 역할:
+#  - 입력: ../../head/{train,test} (원본 crop 이미지)
+#  - 1) 분산(var) 기반으로 "컬러풀한 영역 제거" → 저분산 영역만 keep
+#  - 2) gray 기반으로 white/black/combined 마스크 생성 (두 개의 threshold 사용)
+#  - 3) 최종 마스크 = var_keep & (white_mask | black_mask)
+#  - 4) 출력:
+#      * ../../head/contrast_bw/{split}/{stem}.png
+#          -> 학습용 패턴 (배경은 green, 얼굴 패턴은 gray)
+#      * ../../head/contrast_bw/{split}/{stem}_white_T{...}_B{...}.png
+#      * ../../head/contrast_bw/{split}/{stem}_black_T{...}_B{...}.png
+#      * ../../head/contrast_bw/{split}/{stem}_combined_T{...}_B{...}.png
+#          -> 디버그용 (원본 위에 각각의 마스크 적용 결과)
 
 import os
-import argparse
-from typing import Tuple
-
+import cv2
 import numpy as np
-from PIL import Image
 from tqdm import tqdm
 
+# ======================
+# 경로 / 하이퍼파라미터
+# ======================
 
-# ---------------------------------------------------------
-# Otsu threshold (밝기 기준 자동 이진화)
-# ---------------------------------------------------------
-def otsu_threshold(gray_uint8: np.ndarray) -> int:
+# 시작점: head/train, head/test
+SRC_ROOT = "../../head"
+
+# 최종 contrast_bw 출력 (모델에서 contrast_root로 사용)
+OUT_ROOT = "../../head/contrast_bw_V3"
+
+# 1) 분산 threshold (채널 분산이 이 값 이하인 픽셀만 keep)
+VAR_THRESH = 0.0015  # 네가 실험해서 괜찮다고 본 값으로 시작, 필요하면 조절
+
+# 2) mean 기반 white/black threshold
+T_WHITE = 200   # 이 이상이면 "밝은 털"
+T_BLACK = 50    # 이 이하면 "어두운 털"
+
+# 3) 배경 색 (pattern 이미지에서 사용할 green)
+BG_COLOR = (0, 255, 0)  # BGR
+
+
+# ======================
+# 유틸 함수
+# ======================
+
+def ensure_dir(path: str):
+    os.makedirs(path, exist_ok=True)
+
+
+def apply_mask_visual(img_bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
     """
-    단일 채널 uint8(0~255) 이미지에 대해 Otsu threshold 계산.
-    gray_uint8 : (H,W) uint8
-    return     : threshold (0~255)
+    시각화용:
+      - img_bgr: 원본 BGR 이미지 (H,W,3)
+      - mask   : (H,W) bool
+      -> mask=True 부분: 원본 유지
+         mask=False 부분: green 배경(BG_COLOR)으로 표시
     """
-    hist, _ = np.histogram(gray_uint8.flatten(), bins=256, range=(0, 256))
-    total = gray_uint8.size
 
-    cumulative = np.cumsum(hist)
-    cumulative_mean = np.cumsum(hist * np.arange(256))
+    # (H,W) bool → (H,W,3) bool
+    mask_3 = np.stack([mask] * 3, axis=-1).astype(np.uint8)
 
-    global_mean = cumulative_mean[-1] / max(total, 1)
+    # green 배경 이미지
+    green_bg = np.zeros_like(img_bgr, dtype=np.uint8)
+    green_bg[:] = BG_COLOR   # (0,255,0)
 
-    w0 = cumulative
-    w1 = total - w0
-    valid = (w0 > 0) & (w1 > 0)
+    # mask=True → 원본 유지 / mask=False → green 배경
+    out = np.where(mask_3 == 1, img_bgr, green_bg)
 
-    m0 = np.zeros_like(cumulative_mean, dtype=np.float64)
-    m1 = np.zeros_like(cumulative_mean, dtype=np.float64)
-
-    m0[valid] = cumulative_mean[valid] / w0[valid]
-    m1[valid] = (cumulative_mean[-1] - cumulative_mean[valid]) / w1[valid]
-
-    var_between = (w0 * (m0 - global_mean) ** 2) + (w1 * (m1 - global_mean) ** 2)
-
-    t = int(np.argmax(var_between))
-    return t
+    return out
 
 
-# ---------------------------------------------------------
-# mean + variance 기반 마스크 생성 (단일 이미지)
-# ---------------------------------------------------------
-def make_mask_from_mean_var(
-    img_rgb: np.ndarray,   # (H,W,3) uint8 또는 float32
-    var_thresh: float,
-    min_fg_ratio: float = 0.01,
-) -> np.ndarray:
+def build_var_mask(img_bgr: np.ndarray, var_thresh: float) -> np.ndarray:
     """
-    한 장의 RGB 이미지에 대해:
-      1) 픽셀별 채널 평균(μ), 분산(σ^2) 계산
-      2) 분산 ≤ var_thresh → colorless(그레이 계열) 픽셀
-      3) μ(밝기)에 Otsu threshold 적용 → bright foreground
-      4) 최종 mask = colorless & bright
-
-    return:
-        mask_uint8: (H,W) uint8, {0,255} (255=foreground, 0=background)
+    BGR(0~255) 이미지를 받아서 채널 분산 기반 마스크 생성.
+    - img_bgr: (H,W,3), uint8
+    - return : (H,W) bool, True=keep(저분산, 거의 gray/단색인 영역)
     """
-    # [0,1] float32로 통일
-    if img_rgb.dtype != np.float32:
-        arr = img_rgb.astype(np.float32) / 255.0
-    else:
-        arr = img_rgb
-
-    if arr.ndim == 2:
-        arr = np.stack([arr] * 3, axis=-1)
-
-    # 1) μ, σ^2 (픽셀 단위)
-    mu = arr.mean(axis=2, keepdims=True)             # (H,W,1)
-    diff = arr - mu                                  # (H,W,3)
-    var = (diff * diff).mean(axis=2, keepdims=True)  # (H,W,1)
-
-    # 2) 분산 기반 colorless mask
-    colorless_mask = (var <= var_thresh)             # (H,W,1) bool
-
-    # 3) 밝기(μ)에 Otsu 적용
-    gray_uint8 = np.clip(mu * 255.0 + 0.5, 0, 255).astype(np.uint8).squeeze(axis=2)
-    thr = otsu_threshold(gray_uint8)
-    bright_mask = gray_uint8 >= thr                  # (H,W) bool
-
-    # 4) 최종 mask
-    final_mask = colorless_mask.squeeze(axis=2) & bright_mask  # (H,W) bool
-
-    # 5) foreground 비율이 너무 작으면 fallback
-    fg_ratio = final_mask.astype(np.float32).mean()
-    if fg_ratio < min_fg_ratio:
-        # fallback 정책: 분산만 사용 (colorless만 foreground)
-        final_mask = colorless_mask.squeeze(axis=2)
-
-    # 6) 0/255 uint8로
-    mask_uint8 = np.zeros_like(gray_uint8, dtype=np.uint8)
-    mask_uint8[final_mask] = 255
-    return mask_uint8
+    img_f = img_bgr.astype(np.float32) / 255.0  # [0,1]
+    var = img_f.var(axis=2)                     # (H,W)
+    var_keep = var <= var_thresh
+    return var_keep
 
 
-# ---------------------------------------------------------
-# 디렉토리 단위 처리 (train 또는 test 하나)
-# ---------------------------------------------------------
-def process_split_dir(
-    src_dir: str,
-    mask_dir: str,
-    green_dir: str,
-    var_thresh: float,
-    min_fg_ratio: float,
-    exts=(".jpg", ".jpeg", ".png", ".bmp"),
-):
+def build_mean_masks(gray_uint8: np.ndarray, t_white: int, t_black: int):
     """
-    src_dir 안의 모든 이미지 파일에 대해 mask를 만들고
-    - mask_dir: *_mask.png 저장
-    - green_dir: *_green.png 저장 (배경 초록)
+    gray 기반 white/black/combined 마스크 생성
+    - gray_uint8: (H,W) 0~255
+    - t_white   : white threshold
+    - t_black   : black threshold
     """
+    mask_white = gray_uint8 >= t_white
+    mask_black = gray_uint8 <= t_black
+    mask_combined = mask_white | mask_black
+    return mask_white, mask_black, mask_combined
+
+
+def make_pattern_image(img_bgr: np.ndarray,
+                       gray_uint8: np.ndarray,
+                       final_keep: np.ndarray) -> np.ndarray:
+    """
+    최종 학습용 pattern 이미지 생성:
+    - final_keep=True  → gray 값을 3채널로 복사
+    - final_keep=False → green 배경으로 채움
+    """
+    # gray -> BGR
+    gray_bgr = cv2.cvtColor(gray_uint8, cv2.COLOR_GRAY2BGR)
+
+    # 전체를 green으로 초기화
+    out = np.zeros_like(img_bgr, dtype=np.uint8)
+    out[:, :] = BG_COLOR  # (0,255,0)
+
+    # 얼굴/패턴 부분만 gray 복사
+    out[final_keep] = gray_bgr[final_keep]
+
+    return out
+
+
+# ======================
+# 메인 처리
+# ======================
+
+def process_split(split: str):
+    """
+    split: "train" or "test"
+    입력:  ../../head/{split}
+    출력:  ../../head/contrast_bw/{split}
+    """
+    src_dir = os.path.join(SRC_ROOT, split)
+    dst_dir = os.path.join(OUT_ROOT, split)
+    ensure_dir(dst_dir)
+
     if not os.path.isdir(src_dir):
-        print(f"[INFO] skip split (not found): {src_dir}")
+        print(f"[WARN] skip (no such dir): {src_dir}")
         return
 
-    os.makedirs(mask_dir, exist_ok=True)
-    os.makedirs(green_dir, exist_ok=True)
+    files = [f for f in os.listdir(src_dir)
+             if f.lower().endswith((".png", ".jpg", ".jpeg", ".bmp"))]
 
-    files = [
-        f for f in os.listdir(src_dir)
-        if f.lower().endswith(exts)
-    ]
-    files.sort()
-
-    print(f"[INFO] process_split_dir: {src_dir}")
-    print(f"       -> mask_dir : {mask_dir}")
-    print(f"       -> green_dir: {green_dir} | n={len(files)}")
-
+    print(f"[INFO] split={split} | #files={len(files)}")
     for fname in tqdm(files):
-        src_path = os.path.join(src_dir, fname)
-        base, _ = os.path.splitext(fname)
+        path_in = os.path.join(src_dir, fname)
 
-        # 1) 이미지 로드
-        try:
-            with Image.open(src_path) as im:
-                im = im.convert("RGB")
-                rgb_arr = np.array(im)  # (H,W,3) uint8
-        except Exception as e:
-            print(f"[WARN] failed to open {src_path}: {e}")
+        img = cv2.imread(path_in, cv2.IMREAD_COLOR)
+        if img is None:
+            print(f"[WARN] cannot read: {path_in}")
             continue
 
-        # 2) mask 계산
-        mask_uint8 = make_mask_from_mean_var(
-            rgb_arr, var_thresh=var_thresh, min_fg_ratio=min_fg_ratio
+        base, _ = os.path.splitext(fname)
+
+        # 1) 분산 기반 마스크 (저분산 영역 keep)
+        var_keep = build_var_mask(img, VAR_THRESH)  # (H,W) bool
+
+        # 2) gray 계산
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)  # (H,W) uint8
+
+        # 3) mean 기반 white/black/combined 마스크
+        mask_white, mask_black, mask_mean_comb = build_mean_masks(gray, T_WHITE, T_BLACK)
+
+        # 4) 최종 마스크 = var_keep & (white | black)
+        final_keep = var_keep & mask_mean_comb
+
+        # 안전장치: 최종 마스크가 너무 적으면 var_keep만 사용
+        fg_ratio = final_keep.mean()
+        if fg_ratio < 0.001:
+            final_keep = var_keep
+            print(f"[INFO] fallback to var_only: {fname} (fg_ratio={fg_ratio:.5f})")
+
+        # ==========================
+        # (A) 학습용 최종 pattern 이미지 저장
+        # ==========================ㄹ
+        pattern_img = make_pattern_image(img, gray, final_keep)
+        out_pattern_path = os.path.join(dst_dir, f"{base}.png")
+        cv2.imwrite(out_pattern_path, pattern_img)
+
+        # ==========================
+        # (B) 디버그용 3종 이미지 저장
+        #   - var_keep까지 곱한 white/black/combined 마스크를 적용해서 시각화
+        # ==========================
+        mask_white_final = var_keep & mask_white
+        mask_black_final = var_keep & mask_black
+        mask_comb_final  = final_keep  # 이미 var_keep & (white|black)
+
+        vis_white = apply_mask_visual(img, mask_white_final)
+        vis_black = apply_mask_visual(img, mask_black_final)
+        vis_comb  = apply_mask_visual(img, mask_comb_final)
+
+        cv2.imwrite(
+            os.path.join(dst_dir, f"{base}_white_T{T_WHITE}_B{T_BLACK}.png"),
+            vis_white
+        )
+        cv2.imwrite(
+            os.path.join(dst_dir, f"{base}_black_T{T_WHITE}_B{T_BLACK}.png"),
+            vis_black
+        )
+        cv2.imwrite(
+            os.path.join(dst_dir, f"{base}_combined_T{T_WHITE}_B{T_BLACK}.png"),
+            vis_comb
         )
 
-        # 3) mask 저장
-        mask_name = base + "_mask.png"
-        mask_path = os.path.join(mask_dir, mask_name)
-        try:
-            Image.fromarray(mask_uint8, mode="L").save(mask_path)
-        except Exception as e:
-            print(f"[WARN] failed to save mask {mask_path}: {e}")
 
-        # 4) 초록 배경 버전 RGB 저장
-        try:
-            rgb_green = rgb_arr.copy()
-            green_color = np.array([0, 255, 0], dtype=np.uint8)
-            bg = (mask_uint8 == 0)
-            rgb_green[bg] = green_color
-
-            green_name = base + "_green.png"
-            green_path = os.path.join(green_dir, green_name)
-            Image.fromarray(rgb_green, mode="RGB").save(green_path)
-        except Exception as e:
-            print(f"[WARN] failed to save green RGB {green_path}: {e}")
-
-
-# ---------------------------------------------------------
-# main
-# ---------------------------------------------------------
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--src_root", required=True,
-                    help="원본 RGB 루트 (예: ../../head, 내부에 train/, test/ 존재)")
-    ap.add_argument("--mask_root", required=True,
-                    help="mask PNG 저장 루트 (예: ../../head/mask_mean_var)")
-    ap.add_argument("--green_root", required=True,
-                    help="초록 배경 RGB 저장 루트 (예: ../../head/segmentation_var)")
-    ap.add_argument("--var_thresh", type=float, default=0.003,
-                    help="채널 분산 임계값 (기본=0.003, sweep 결과에 맞게 조정 가능)")
-    ap.add_argument("--min_fg_ratio", type=float, default=0.01,
-                    help="foreground 비율이 너무 낮을 때 fallback에 사용하는 최소 비율")
-    args = ap.parse_args()
-
-    print(f"[INFO] src_root    : {args.src_root}")
-    print(f"[INFO] mask_root   : {args.mask_root}")
-    print(f"[INFO] green_root  : {args.green_root}")
-    print(f"[INFO] var_thresh  : {args.var_thresh}")
-    print(f"[INFO] min_fg_ratio: {args.min_fg_ratio}")
-
-    # train / test 두 split 처리
     for split in ["train", "test"]:
-        src_dir   = os.path.join(args.src_root,   split)
-        mask_dir  = os.path.join(args.mask_root,  split)
-        green_dir = os.path.join(args.green_root, split)
-
-        process_split_dir(
-            src_dir=src_dir,
-            mask_dir=mask_dir,
-            green_dir=green_dir,
-            var_thresh=args.var_thresh,
-            min_fg_ratio=args.min_fg_ratio,
-        )
+        process_split(split)
 
 
 if __name__ == "__main__":
