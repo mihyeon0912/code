@@ -1,192 +1,158 @@
-# model.py  (코드명: MODEL_RGB_CONTRAST_CONCAT_V1)
-# 역할:
-#  - forward(rgb_norm, contrast_bw):
-#      * rgb_norm    : (B,3,224,224) ImageNet 정규화 RGB
-#      * contrast_bw : (B,3,224,224) [0,1], 배경은 (0,1,0) green, 전경은 흑/백(R=G=B)
-#  - contrast_bw에서 green 배경을 마스크로 제거하고 1채널 패턴 추출
-#  - ImageBackbone(ResNet50, RGB) + PatternBackbone(ResNet18, 1ch 패턴)
-#  - 두 feature map을 채널 concat → GAP → Linear → L2 normalize
-
-from typing import Tuple
+# model.py
+# CODE NAME: MODEL_CROSS_ATTENTION_PATTERN_V_FINAL
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchvision import models
+from torchvision.models import resnet50, resnet18
+import math
 
+
+# =========================================================
+# position_embedding
+# =========================================================
+def build_2d_sincos_position_embedding(h, w, dim, device):
+    """
+    2D sine-cosine positional embedding
+    Return: (1, H*W, dim)
+    """
+    assert dim % 4 == 0, "dim must be divisible by 4"
+
+    grid_y, grid_x = torch.meshgrid(
+        torch.arange(h, device=device),
+        torch.arange(w, device=device),
+        indexing="ij"
+    )
+
+    omega = torch.arange(dim // 4, device=device) / (dim // 4)
+    omega = 1.0 / (10000 ** omega)
+
+    out_y = torch.einsum("hw,d->hwd", grid_y, omega)
+    out_x = torch.einsum("hw,d->hwd", grid_x, omega)
+
+    pe = torch.cat(
+        [
+            torch.sin(out_x),
+            torch.cos(out_x),
+            torch.sin(out_y),
+            torch.cos(out_y),
+        ],
+        dim=-1
+    )
+
+    pe = pe.view(1, h * w, dim)
+    return pe
 
 # =========================================================
 # Backbones
 # =========================================================
 class ImageBackbone(nn.Module):
-    """
-    ResNet50 백본에서 feature map 추출 후 1x1 conv로 d 채널 정렬.
-    입력: (B,3,224,224)  [ImageNet 정규화]
-    출력: (B, d, h, w)  (보통 h=w=7)
-    """
-    def __init__(self, d: int = 256, pretrained: bool = True):
+    def __init__(self, d=256, pretrained=True):
         super().__init__()
-        resnet = models.resnet50(
-            weights=models.ResNet50_Weights.IMAGENET1K_V2 if pretrained else None
-        )
-        self.stem = nn.Sequential(
-            resnet.conv1, resnet.bn1, resnet.relu, resnet.maxpool
-        )
-        self.layer1 = resnet.layer1
-        self.layer2 = resnet.layer2
-        self.layer3 = resnet.layer3
-        self.layer4 = resnet.layer4
-        self.proj = nn.Conv2d(2048, d, kernel_size=1, bias=False)
-        self.bn   = nn.BatchNorm2d(d)
+        net = resnet50(pretrained=pretrained)
+        self.body = nn.Sequential(*list(net.children())[:-2])
+        self.proj = nn.Conv2d(2048, d, 1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.stem(x)
-        x = self.layer1(x)
-        x = self.layer2(x)
-        x = self.layer3(x)
-        x = self.layer4(x)          # (B,2048,h,w)
-        x = self.proj(x)            # (B,d,h,w)
-        x = self.bn(x)
-        return x
+    def forward(self, x):
+        return self.proj(self.body(x))
 
 
 class PatternBackbone(nn.Module):
-    """
-    ResNet18 기반 1채널 입력 백본.
-    contrast_bw에서 추출한 1채널 패턴을 입력으로 사용.
-    입력: (B,1,224,224) in [0,1]
-    출력: (B, d, h, w)  (보통 h=w=7)
-    """
-    def __init__(self, d: int = 256, pretrained: bool = True):
+    def __init__(self, d=256, pretrained=True):
         super().__init__()
-        base = models.resnet18(
-            weights=models.ResNet18_Weights.IMAGENET1K_V1 if pretrained else None
-        )
+        net = resnet18(pretrained=pretrained)
+        net.conv1 = nn.Conv2d(1, 64, 7, 2, 3, bias=False)
+        self.body = nn.Sequential(*list(net.children())[:-2])
+        self.proj = nn.Conv2d(512, d, 1)
 
-        # conv1을 1ch용으로 교체 (pretrained conv 평균 사용)
-        old_conv: nn.Conv2d = base.conv1
-        new_conv = nn.Conv2d(
-            1, old_conv.out_channels,
-            kernel_size=old_conv.kernel_size,
-            stride=old_conv.stride,
-            padding=old_conv.padding,
-            bias=False,
-        )
-        with torch.no_grad():
-            if pretrained and old_conv.weight.shape[1] == 3:
-                new_conv.weight.copy_(old_conv.weight.mean(dim=1, keepdim=True))
-            else:
-                nn.init.kaiming_normal_(new_conv.weight, mode="fan_out", nonlinearity="relu")
-        base.conv1 = new_conv
-
-        self.stem = nn.Sequential(
-            base.conv1, base.bn1, base.relu, base.maxpool
-        )
-        self.layer1 = base.layer1
-        self.layer2 = base.layer2
-        self.layer3 = base.layer3
-        self.layer4 = base.layer4
-        self.proj = nn.Conv2d(512, d, kernel_size=1, bias=False)
-        self.bn   = nn.BatchNorm2d(d)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.stem(x)
-        x = self.layer1(x)
-        x = self.layer2(x)
-        x = self.layer3(x)
-        x = self.layer4(x)          # (B,512,h,w)
-        x = self.proj(x)            # (B,d,h,w)
-        x = self.bn(x)
-        return x
+    def forward(self, x):
+        return self.proj(self.body(x))
 
 
 # =========================================================
-# contrast_bw → 1채널 패턴
+# SE on pattern
 # =========================================================
-@torch.no_grad()
-def extract_pattern_from_contrast_bw(
-    contrast_rgb_01: torch.Tensor,
-    green_g_thresh: float = 0.7,
-    green_rb_thresh: float = 0.3,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    contrast_rgb_01: (B,3,H,W) in [0,1]
-      - 배경: (0,1,0) 근처 green
-      - 전경: R=G=B (0 or 1) 흑/백 패턴
+class PatternSE(nn.Module):
+    def __init__(self, d):
+        super().__init__()
+        self.fc = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(d, d // 4, 1),
+            nn.ReLU(),
+            nn.Conv2d(d // 4, d, 1),
+            nn.Sigmoid(),
+        )
 
-    returns:
-      pattern_1ch: (B,1,H,W) in [0,1], 배경은 0
-      keep_hw    : (B,H,W) bool, 전경 True
-    """
-    R = contrast_rgb_01[:, 0]
-    G = contrast_rgb_01[:, 1]
-    B = contrast_rgb_01[:, 2]
+    def forward(self, x):
+        return x * (1.0 + self.fc(x))
 
-    # green 배경: G 크고, R/B 작고, G 자체도 충분히 큼
-    green_bg = (G > green_g_thresh) & (R < green_rb_thresh) & (B < green_rb_thresh)
-    keep_hw = ~green_bg  # 전경 True
-
-    # 전경 영역에서 R,G,B가 거의 같으므로 채널 평균 사용
-    gray = contrast_rgb_01.mean(dim=1, keepdim=True)   # (B,1,H,W)
-    pattern = gray * keep_hw.unsqueeze(1).float()
-
-    return pattern, keep_hw
 
 
 # =========================================================
-# CombinedEmbedding (RGB + contrast_bw concat)
+# Cross Attention
+# =========================================================
+class CrossAttention(nn.Module):
+    def __init__(self, d, nheads):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(
+            embed_dim=d,
+            num_heads=nheads,
+            batch_first=True,
+        )
+
+    def forward(self, q, kv, key_padding_mask):
+        out, _ = self.attn(
+            q, kv, kv,
+            key_padding_mask=~key_padding_mask
+        )
+        return out
+
+
+# =========================================================
+# Combined Model
 # =========================================================
 class CombinedEmbedding(nn.Module):
-    """
-    최종 임베딩 = ImageBackbone(RGB) + PatternBackbone(contrast_bw→1ch pattern)
-
-    구조:
-      1) rgb_norm      → ImageBackbone(ResNet50)       → img_fm (B,d,h,w)
-      2) contrast_bw   → extract_pattern_from_contrast_bw → pat_1ch
-                       → PatternBackbone(ResNet18,1ch) → pat_fm (B,d,h,w)
-      3) concat(ch)    → feat (B,2d,h,w)
-      4) GAP           → (B,2d)
-      5) Linear(2d→fused_dim) → L2 normalize
-    """
-    def __init__(
-        self,
-        d: int = 256,
-        fused_dim: int = 128,
-        nblocks: int = 0,          # (호환용, 사용하지 않음)
-        nheads: int = 0,           # (호환용, 사용하지 않음)
-        pdrop: float = 0.0,        # (호환용, 사용하지 않음)
-        mlp_ratio: float = 4.0,    # (호환용, 사용하지 않음)
-        pretrained_backbones: bool = True,
-        # 아래 두 파라미터는 이전 버전과 호환을 위해 남겨두지만 사용하지 않음
-        keep_thresh: float = 0.05,
-        min_fg_ratio: float = 0.01,
-    ):
+    def __init__(self, d=256, fused_dim=128, nheads=4):
         super().__init__()
-        self.d = d
-        self.img_backbone = ImageBackbone(d=d, pretrained=pretrained_backbones)
-        self.pat_backbone = PatternBackbone(d=d, pretrained=pretrained_backbones)
+        self.img_backbone = ImageBackbone(d)
+        self.pat_backbone = PatternBackbone(d)
+        self.pattern_se = PatternSE(d)
+        self.cross_attn = CrossAttention(d, nheads)
 
-        self.gap = nn.AdaptiveAvgPool2d((1, 1))
-        self.head = nn.Linear(2 * d, fused_dim)
-        self.embed_dim = fused_dim
+        self.gap = nn.AdaptiveAvgPool1d(1)
+        self.head = nn.Linear(d, fused_dim)
 
-    def forward(self, rgb: torch.Tensor, contrast_rgb_01: torch.Tensor) -> torch.Tensor:
-        """
-        rgb            : (B,3,224,224), ImageNet 정규화
-        contrast_rgb_01: (B,3,224,224), [0,1], 배경 green + 전경 흑/백
-        """
-        # 1) RGB branch
-        img_fm = self.img_backbone(rgb)  # (B,d,h,w)
+    def forward(self, rgb, pattern_1ch, seg_mask_hw):
+        img_fm = self.img_backbone(rgb)      # (B,d,H,W)
+        pat_fm = self.pattern_se(
+            self.pat_backbone(pattern_1ch)
+        )
 
-        # 2) contrast_bw → 1ch pattern → pattern branch
-        pat_1ch, _ = extract_pattern_from_contrast_bw(contrast_rgb_01)  # (B,1,H,W)
-        pat_fm = self.pat_backbone(pat_1ch)                             # (B,d,h,w)
+        B, C, H, W = img_fm.shape
+        img_tok = img_fm.flatten(2).transpose(1, 2)   # (B,N,d)
+        pat_tok = pat_fm.flatten(2).transpose(1, 2)
 
-        # 3) concat + GAP
-        feat = torch.cat([img_fm, pat_fm], dim=1)  # (B,2d,h,w)
-        pooled = self.gap(feat).flatten(1)         # (B,2d)
+        # -------------------------------
+        # 2D Positional Encoding
+        # -------------------------------
+        pos = build_2d_sincos_position_embedding(
+            h=H,
+            w=W,
+            dim=C,
+            device=img_tok.device
+        )  # (1, N, C)
 
-        # 4) Linear + L2 normalize
-        z = self.head(pooled)                      # (B,fused_dim)
-        z = F.normalize(z, dim=1, eps=1e-6)
+        img_tok = img_tok + pos
+        pat_tok = pat_tok + pos
+
+        mask = F.interpolate(
+            seg_mask_hw.unsqueeze(1).float(),
+            size=(H, W),
+            mode="nearest"
+        ).flatten(2).squeeze(1).bool()
+
+        attn = self.cross_attn(img_tok, pat_tok, mask)
+        pooled = self.gap(attn.transpose(1, 2)).squeeze(-1)
+
+        z = F.normalize(self.head(pooled), dim=1)
         return z
